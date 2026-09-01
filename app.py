@@ -1,860 +1,171 @@
-import os
-import json
-import re
-import tempfile
+"""
+Back Office AI Router — entrypoint.
 
-import pandas as pd
+Uploads office documents (PDF/DOCX/TXT), classifies each one with an
+LLM, suggests which department it should be routed to, and lets the
+user chat with each document via a RAG assistant.
+
+Run with:  streamlit run app.py
+"""
+
 import streamlit as st
 
-from dotenv import load_dotenv
-
-from langchain_community.document_loaders import (
-    PyPDFLoader,
-    Docx2txtLoader,
-    TextLoader
+from src.classification import ClassificationParseError, classify_document
+from src.config import configure_page, load_groq_api_key
+from src.document_loader import (
+    EmptyFileError,
+    FileTooLargeError,
+    UnsupportedFileTypeError,
+    compute_file_hash,
+    get_file_extension,
+    load_documents,
+    save_temp_file,
+    validate_documents_not_empty,
+    validate_file_size,
+)
+from src.models import build_chat_agent, build_classification_chain, load_embeddings
+from src.rag_engine import answer_question, build_retriever
+from frontend.styles import apply_custom_styles
+from frontend.ui_components import (
+    NAV_CHAT,
+    NAV_CLASSIFICATION,
+    render_chat_exchange,
+    render_chat_history,
+    render_chat_input,
+    render_classification_result,
+    render_export_button,
+    render_file_title,
+    render_file_uploader,
+    render_footer,
+    render_header,
+    render_sidebar_nav,
 )
 
-from langchain_text_splitters import (
-    RecursiveCharacterTextSplitter
-)
-
-from langchain_groq import ChatGroq
-
-from langchain_core.prompts import (
-    ChatPromptTemplate
-)
-
-from langchain_huggingface import (
-    HuggingFaceEmbeddings
-)
-
-from langchain_community.vectorstores import (
-    FAISS
-)
-
-
-# =========================================================
-# PAGE CONFIG
-# =========================================================
-
-st.set_page_config(
-    page_title="Back Office AI Router",
-    layout="wide"
-)
-
-
-# =========================================================
-# CUSTOM CSS
-# =========================================================
-
-st.markdown("""
-<style>
-
-.stApp {
-    background: linear-gradient(
-        135deg,
-        #f8fafc,
-        #e2e8f0
-    );
-    color: #0f172a;
-}
-
-.block-container {
-    padding-top: 2rem;
-    padding-bottom: 3rem;
-}
-
-/* Main Panels */
-
-.panel {
-    background: white;
-    border-radius: 20px;
-    padding: 24px;
-    margin-bottom: 24px;
-    box-shadow:
-        0 10px 30px rgba(0,0,0,0.06);
-}
-
-/* File Title */
-
-.file-title {
-    font-size: 2rem;
-    font-weight: 700;
-    margin-top: 1rem;
-    margin-bottom: 1rem;
-    color: #0f172a;
-}
-
-/* Chat Input */
-
-.stTextInput input {
-    border-radius: 14px !important;
-    border: 1px solid #cbd5e1 !important;
-    padding: 12px !important;
-    font-size: 16px !important;
-}
-
-/* Assistant Chat */
-
-[data-testid="stChatMessage"] {
-    background: white !important;
-    border-radius: 16px !important;
-    color: #0f172a !important;
-    border: 1px solid #e2e8f0 !important;
-    padding: 14px !important;
-    margin-top: 12px !important;
-}
-
-/* User Message */
-
-[data-testid="stChatMessage"]:has(
-    [data-testid="chatAvatarIcon-user"]
-) {
-    background: #dbeafe !important;
-    color: #0f172a !important;
-}
-
-/* Assistant Message */
-
-[data-testid="stChatMessage"]:has(
-    [data-testid="chatAvatarIcon-assistant"]
-) {
-    background: #ffffff !important;
-    color: #0f172a !important;
-}
-
-/* Fix Assistant Text */
-
-[data-testid="stChatMessageContent"] {
-    color: #0f172a !important;
-    font-size: 16px !important;
-    line-height: 1.7 !important;
-}
-
-/* Buttons */
-
-.stButton button,
-.stDownloadButton button {
-
-    background: #2563eb !important;
-    color: white !important;
-
-    border: none !important;
-
-    border-radius: 12px !important;
-
-    padding:
-        0.6rem 1.2rem !important;
-
-    font-weight: 600 !important;
-
-    transition: 0.2s ease-in-out !important;
-}
-
-/* Button Hover */
-
-.stButton button:hover,
-.stDownloadButton button:hover {
-
-    background: #1d4ed8 !important;
-    color: white !important;
-
-    transform: translateY(-1px);
-}
-
-/* Expander */
-
-.streamlit-expanderHeader {
-    font-weight: 600 !important;
-    color: #0f172a !important;
-}
-
-/* Metrics */
-
-[data-testid="stMetricValue"] {
-    color: #0f172a !important;
-}
-
-/* Progress Bar */
-
-.stProgress > div > div > div > div {
-    background-color: #2563eb !important;
-}
-/* Containers */
-
-[data-testid="stVerticalBlock"] > div:has(
-    div[data-testid="stChatMessage"]
-) {
-    gap: 0.8rem;
-}
-
-/* Text Inputs */
-
-.stTextInput {
-    margin-top: 1rem;
-    margin-bottom: 1rem;
-}
-
-/* Cards */
-
-[data-testid="stVerticalBlockBorderWrapper"] {
-    border-radius: 18px !important;
-    border: 1px solid #dbe4ee !important;
-    padding: 1rem !important;
-    background: white !important;
-}
-</style>
-""", unsafe_allow_html=True)
-
-
-# =========================================================
-# ENV VARIABLES
-# =========================================================
-
-load_dotenv()
-
-groq_api_key = os.getenv(
-    "GROQ_API_KEY"
-)
-
-if not groq_api_key:
-
-    st.error(
-        "GROQ_API_KEY missing in .env"
-    )
-
-    st.stop()
-
-os.environ["GROQ_API_KEY"] = groq_api_key
-
-
-# =========================================================
-# ROUTING MAP
-# =========================================================
-
-ROUTING_MAP = {
-    "Invoice":
-        "Finance / Accounts Payable",
-
-    "Purchase Order":
-        "Procurement / Supply Chain",
-
-    "Contract":
-        "Legal / Compliance",
-
-    "HR Document":
-        "Human Resources",
-
-    "Internal Memo":
-        "Operations / Admin",
-
-    "Financial Report":
-        "Finance / Management"
-}
-
-
-def suggest_routing(
-    doc_type: str
-) -> str:
-
-    return ROUTING_MAP.get(
-        doc_type,
-        "Back Office Review"
-    )
-
-
-# =========================================================
-# CLEAN JSON
-# =========================================================
-
-def clean_llm_json(text: str) -> str:
-
-    text = re.sub(
-        r"```json",
-        "",
-        text,
-        flags=re.IGNORECASE
-    )
-
-    text = re.sub(
-        r"```",
-        "",
-        text
-    )
-
-    match = re.search(
-        r"\{.*\}",
-        text,
-        re.DOTALL
-    )
-
-    if match:
-        return match.group(0)
-
-    return text.strip()
-
-
-# =========================================================
-# LOAD EMBEDDINGS
-# =========================================================
-
-@st.cache_resource
-def load_embeddings():
-
-    return HuggingFaceEmbeddings(
-        model_name=
-        "sentence-transformers/all-MiniLM-L6-v2"
-    )
-
+configure_page()
+apply_custom_styles()
+load_groq_api_key()
 
 embeddings = load_embeddings()
+chat_agent = build_chat_agent()
+classification_chain = build_classification_chain()
 
+render_header()
 
-# =========================================================
-# LOAD CHAT MODEL
-# =========================================================
-
-@st.cache_resource
-def load_chat_model():
-
-    return ChatGroq(
-        model="llama-3.3-70b-versatile",
-        temperature=0
-    )
-
-
-chat_llm = load_chat_model()
-
-
-# =========================================================
-# CLASSIFICATION CHAIN
-# =========================================================
-
-@st.cache_resource
-def build_classification_chain():
-
-    llm = ChatGroq(
-        model="openai/gpt-oss-20b",
-        temperature=0
-    )
-
-    prompt = ChatPromptTemplate.from_template("""
-You are an office document
-classification assistant.
-
-Classify into one of:
-
-- Invoice
-- Purchase Order
-- Contract
-- HR Document
-- Internal Memo
-- Financial Report
-
-Return ONLY valid JSON.
-
-Format:
-{{
-  "document_type": "...",
-  "confidence": 0.0,
-  "recommended_department": "...",
-  "reasoning": "..."
-}}
-
-Document:
-{document_text}
-""")
-
-    return prompt | llm
-
-
-classification_chain = (
-    build_classification_chain()
-)
-
-
-# =========================================================
-# HEADER
-# =========================================================
-
-st.markdown("""
-<div class="panel">
-
-<h1>
-Back Office AI Router
-</h1>
-
-</div>
-""", unsafe_allow_html=True)
-
-
-# =========================================================
-# FILE UPLOAD
-# =========================================================
-
-uploaded_files = st.file_uploader(
-    "Upload PDF, DOCX, TXT",
-    type=["pdf", "docx", "txt"],
-    accept_multiple_files=True
-)
-
-
-# =========================================================
-# STORAGE
-# =========================================================
+with st.sidebar:
+    st.markdown("#### Upload")
+    uploaded_files = render_file_uploader()
+    st.markdown("---")
+    nav_choice = render_sidebar_nav()
 
 results_data = []
 
+# Cache per-file processing (loading, classification, embedding) across
+# Streamlit reruns — otherwise every chat question re-triggers the full
+# pipeline for every uploaded file, which is what made large PDFs feel slow.
+if "processed_files" not in st.session_state:
+    st.session_state.processed_files = {}
 
-# =========================================================
-# PROCESS FILES
-# =========================================================
+# Per-file multi-turn chat history, keyed by file hash, so asking a new
+# question doesn't lose earlier ones in the same session.
+if "chat_histories" not in st.session_state:
+    st.session_state.chat_histories = {}
+
+processed_cache = st.session_state.processed_files
+chat_histories = st.session_state.chat_histories
 
 if uploaded_files:
-
-    st.success(
-        f"{len(uploaded_files)} file(s) uploaded successfully"
-    )
+    st.success(f"{len(uploaded_files)} file(s) uploaded successfully")
 
     for uploaded_file in uploaded_files:
         with st.container(border=True):
             file_name = uploaded_file.name
+            file_extension = get_file_extension(file_name)
 
-            file_extension = (
-                file_name.rsplit(".", 1)[-1].lower()
-                if "." in file_name
-                else ""
-            )
-
-            st.markdown(
-                f"""
-                <div class="file-title">
-                    {file_name}
-                </div>
-                """,
-                unsafe_allow_html=True
-            )
-            temp_path = None
+            render_file_title(file_name)
 
             try:
+                file_bytes = uploaded_file.getvalue()
+                file_hash = compute_file_hash(file_bytes)
 
-                # =============================================
-                # SAVE TEMP FILE
-                # =============================================
-
-                file_bytes = (
-                    uploaded_file.getvalue()
-                )
-
-                with tempfile.NamedTemporaryFile(
-                    delete=False,
-                    suffix=f".{file_extension}"
-                ) as tmp:
-
-                    tmp.write(file_bytes)
-
-                    temp_path = tmp.name
-
-                # =============================================
-                # DOCUMENT LOADER
-                # =============================================
-
-                if file_extension == "pdf":
-
-                    loader = PyPDFLoader(
-                        temp_path
-                    )
-
-                elif file_extension == "docx":
-
-                    loader = Docx2txtLoader(
-                        temp_path
-                    )
-
-                elif file_extension == "txt":
-
-                    loader = TextLoader(
-                        temp_path,
-                        encoding="utf-8"
-                    )
+                if file_hash in processed_cache:
+                    # Already loaded, classified, and embedded earlier in
+                    # this session — reuse it instead of redoing the work.
+                    cached = processed_cache[file_hash]
+                    result = cached["result"]
+                    retriever = cached["retriever"]
 
                 else:
+                    validate_file_size(file_bytes)
 
-                    st.error(
-                        "Unsupported file type"
-                    )
+                    with save_temp_file(file_bytes, file_extension) as temp_path:
+                        docs = load_documents(temp_path, file_extension)
+                        validate_documents_not_empty(docs)
 
-                    continue
+                        with st.spinner(
+                            f"Processing {file_name} ({len(docs)} page(s))... "
+                            f"this only happens once per document."
+                        ):
+                            # ---- Classification -----------------------
+                            result = classify_document(docs, classification_chain)
 
-                docs = loader.load()
+                            # ---- Build RAG retriever (chunk + embed) --
+                            retriever = build_retriever(docs, embeddings)
 
-                # =============================================
-                # SPLIT FOR CLASSIFICATION
-                # =============================================
-
-                splitter = (
-                    RecursiveCharacterTextSplitter(
-                        chunk_size=500,
-                        chunk_overlap=50
-                    )
-                )
-
-                split_docs = (
-                    splitter.split_documents(
-                        docs
-                    )
-                )
-
-                text = "\n\n".join(
-                    [
-                        doc.page_content
-                        for doc in split_docs
-                    ]
-                )[:6000]
-
-                # =============================================
-                # CLASSIFICATION
-                # =============================================
-
-                with st.spinner(
-                    "Analyzing document..."
-                ):
-
-                    response = (
-                        classification_chain.invoke(
-                            {
-                                "document_text": text
-                            }
-                        )
-                    )
-
-                cleaned = clean_llm_json(
-                    response.content
-                )
-
-                result = json.loads(
-                    cleaned
-                )
-
-                doc_type = str(
-                    result.get(
-                        "document_type",
-                        "Unknown"
-                    )
-                )
-
-                confidence = float(
-                    result.get(
-                        "confidence",
-                        0
-                    )
-                )
-
-                department = str(
-                    result.get(
-                        "recommended_department",
-                        "Unknown"
-                    )
-                )
-
-                reasoning = str(
-                    result.get(
-                        "reasoning",
-                        "No reasoning provided."
-                    )
-                )
-
-                routing = suggest_routing(
-                    doc_type
-                )
-
-                # =============================================
-                # RESULT CARD
-                # =============================================
-
-                with st.container(
-                    border=True
-                ):
-
-                    st.markdown(
-                        f"## {doc_type}"
-                    )
-
-                    col1, col2 = st.columns(2)
-
-                    with col1:
-
-                        st.metric(
-                            "Department",
-                            department
-                        )
-
-                    with col2:
-
-                        st.metric(
-                            "Routing",
-                            routing
-                        )
-
-                    st.markdown(
-                        "### Reasoning"
-                    )
-
-                    st.info(
-                        reasoning
-                    )
-
-                    if confidence >= 0.85:
-
-                        st.success(
-                            f"""
-    Confidence:
-    {confidence:.2f} (High)
-    """
-                        )
-
-                    elif confidence >= 0.60:
-
-                        st.warning(
-                            f"""
-    Confidence:
-    {confidence:.2f} (Medium)
-    """
-                        )
-
-                    else:
-
-                        st.error(
-                            f"""
-    Confidence:
-    {confidence:.2f} (Low)
-    """
-                        )
-
-                    st.progress(
-                        confidence
-                    )
-
-                # =============================================
-                # DOCUMENT RAG
-                # =============================================
-
-                st.markdown("""
-                ### AI Document Assistant
-                """)
-
-                rag_splitter = (
-                    RecursiveCharacterTextSplitter(
-                        chunk_size=1000,
-                        chunk_overlap=200
-                    )
-                )
-
-                rag_docs = (
-                    rag_splitter.split_documents(
-                        docs
-                    )
-                )
-
-                vectorstore = (
-                    FAISS.from_documents(
-                        rag_docs,
-                        embeddings
-                    )
-                )
-
-                retriever = (
-                    vectorstore.as_retriever(
-                        search_kwargs={"k": 4}
-                    )
-                )
-
-                # =============================================
-                # AGENT FUNCTION
-                # =============================================
-
-                def agent(user_question):
-
-                    retrieved_docs = (
-                        retriever.invoke(
-                            user_question
-                        )
-                    )
-
-                    context = "\n\n".join(
-                        [
-                            doc.page_content
-                            for doc in retrieved_docs
-                        ]
-                    )
-
-                    prompt = f"""
-    You are a helpful AI assistant.
-
-    Answer ONLY from the
-    provided context.
-
-    If the answer is not found,
-    say you could not find it.
-
-    Context:
-    {context}
-
-    Question:
-    {user_question}
-    """
-
-                    response = (
-                        chat_llm.invoke(
-                            prompt
-                        )
-                    )
-
-                    return {
-                        "answer":
-                            response.content,
-
-                        "sources":
-                            retrieved_docs
+                    processed_cache[file_hash] = {
+                        "result": result,
+                        "retriever": retriever,
                     }
 
-                # =============================================
-                # CHAT INPUT
-                # =============================================
+                if nav_choice == NAV_CLASSIFICATION:
+                    render_classification_result(result)
 
-                user_question = st.text_input(
-                    f"Ask anything about {file_name}",
-                    key=f"chat_{file_name}",
-                    placeholder="Summarize the document, find signatures, payment details..."
-                )
-                # =============================================
-                # CHAT RESPONSE
-                # =============================================
+                else:  # NAV_CHAT
+                    history = chat_histories.setdefault(file_hash, [])
 
-                if user_question:
+                    render_chat_history(history)
 
-                    with st.chat_message(
-                        "user"
-                    ):
-
-                        st.markdown(
-                            user_question
-                        )
-
-                    with st.spinner(
-                        f"Searching {file_name}..."
-                    ):
-
-                        response = agent(
-                            user_question
-                        )
-
-                    with st.chat_message(
-                        "assistant"
-                    ):
-
-                        st.markdown(
-                            response["answer"]
-                        )
-
-                        with st.expander(
-                            "View Sources"
-                        ):
-
-                            for i, doc in enumerate(
-                                response["sources"],
-                                start=1
-                            ):
-
-                                st.markdown(
-                                    f"### Source {i}"
-                                )
-
-                                st.code(
-                                    doc.page_content[:800], language=None
-                                )
-
-                st.divider()
-
-                # =============================================
-                # STORE RESULTS
-                # =============================================
-
-                results_data.append({
-
-                    "File Name":
-                        file_name,
-
-                    "Document Type":
-                        doc_type,
-
-                    "Department":
-                        department,
-
-                    "Routing Suggestion":
-                        routing,
-
-                    "Confidence":
-                        round(confidence, 2),
-
-                    "Reason":
-                        reasoning
-                })
-
-            except Exception as e:
-
-                st.error(
-                    "Could not process document"
-                )
-
-                st.caption(
-                    str(e)
-                )
-
-            finally:
-
-                if (
-                    temp_path
-                    and os.path.exists(temp_path)
-                ):
-
-                    os.unlink(
-                        temp_path
+                    user_question = render_chat_input(
+                        file_name, key=f"chat_input_{file_hash}"
                     )
 
+                    if user_question:
+                        with st.spinner(f"Searching {file_name}..."):
+                            response = answer_question(
+                                user_question, retriever, chat_agent
+                            )
 
-# =========================================================
-# EXPORT RESULTS
-# =========================================================
+                        history.append((user_question, response))
+                        render_chat_exchange(user_question, response)
 
-if results_data:
+                st.divider()
+                # ---- Collect for export --------------------------
+                results_data.append(
+                    {
+                        "File Name": file_name,
+                        "Document Type": result.doc_type,
+                        "Department": result.department,
+                        "Routing Suggestion": result.routing,
+                        "Confidence": round(result.confidence, 2),
+                        "Reason": result.reasoning,
+                    }
+                )
 
-    st.markdown(
-        "## Export Results"
-    )
+            except UnsupportedFileTypeError:
+                st.error("Unsupported file type")
 
-    df = pd.DataFrame(
-        results_data
-    )
+            except FileTooLargeError as e:
+                st.error(str(e))
 
-    csv = df.to_csv(
-        index=False
-    ).encode("utf-8")
+            except EmptyFileError as e:
+                st.error(str(e))
 
-    st.download_button(
-        label="Download CSV",
-        data=csv,
-        file_name="document_results.csv",
-        mime="text/csv"
-    )
+            except ClassificationParseError as e:
+                st.error("The AI returned an unreadable classification for this document.")
+                st.caption(str(e))
 
+            except Exception as e:  # noqa: BLE001 - surface any processing error
+                st.error("Could not process document")
+                st.caption(str(e))
 
-# =========================================================
-# FOOTER
-# =========================================================
-
-st.markdown("---")
-
-st.caption(
-    "Back Office AI Router • AI Document Intelligence System"
-)
+render_export_button(results_data)
+render_footer()

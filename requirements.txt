@@ -3,10 +3,11 @@ pandas
 python-dotenv
 langchain
 langchain-community
-langchain-groq
-langchain-huggingface
 langchain-text-splitters
-sentence-transformers
+langchain-groq
+langchain-core
+langchain-huggingface
 faiss-cpu
 pypdf
 docx2txt
+sentence-transformers
